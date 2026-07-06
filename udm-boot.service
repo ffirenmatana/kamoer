@@ -1,0 +1,12 @@
+[Unit]
+Description=Run /data/on_boot.d scripts at boot (Kamoer X2SR + user boot scripts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for f in /data/on_boot.d/*.sh; do [ -f "$f" ] && sh "$f"; done'
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

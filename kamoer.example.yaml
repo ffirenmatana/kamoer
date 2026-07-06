@@ -1,0 +1,517 @@
+# Kamoer X2SR water changer — LOCAL control + AUTO/MANUAL logic + decoded progress.
+# Path: X2SR (<DEVICE_IP>) --TLS--> UDM injecting proxy (<ROUTER_IP>:8883)
+#   --plaintext--> Mosquitto (<BROKER_IP>:1883). No Kamoer cloud / app.
+# Control frame (hex in PumpSerialNumber):
+#   [seq] 02 00 07 00 08 00 0e [CH] [ACT] 00 [volume float32 BE]
+#   CH 01=Add Sea Water(fill) / 00=Discharge(drain);  ACT 01=start / 00=stop
+#   seq MUST advance each command (device dedups same seq) -> input_number.kamoer_seq
+# Status poll: [seq]00000000080005  -> response has run-flag@char50-51, target@54-61, remaining@62-69
+#
+# !!! SAFETY PHILOSOPHY (per owner): this pump CANNOT induce a dangerous fail state.
+#     It shifts <50 L/hr into a ~2000 L system; peristaltic heads run dry safely; a full
+#     45 L change against an empty reservoir just under-fills — no overflow, no harm, top up
+#     later. Therefore POWER IS NEVER CUT REFLEXIVELY. Automations STOP via MQTT + notify only.
+#     Cutting power forces a cold boot, and a cold boot is the ONE thing that wedges the device
+#     (it needs its boot handshake) — so a reflex power cut is itself the main hazard.
+#     Power is cut ONLY by: (a) the manual kamoer_emergency_stop button, or (b) the
+#     non-response watchdog after the pump has ignored MQTT for 30 min. Both MQTT-stop first.
+
+#############################  HELPERS  #############################
+input_boolean:
+  kamoer_auto_enabled:
+    name: Kamoer AUTO Enabled
+    icon: mdi:autorenew
+  kamoer_safety_lockout:
+    name: Kamoer Safety Lockout
+    icon: mdi:alert-octagon
+  kamoer_change_running:
+    name: Kamoer Change Running
+    icon: mdi:water-sync
+
+input_number:
+  kamoer_seq:                 # monotonic command sequence byte (0-255, wraps)
+    name: Kamoer Seq
+    min: 0
+    max: 255
+    step: 1
+    mode: box
+    icon: mdi:counter
+  kamoer_volume:
+    name: Kamoer Volume
+    min: 10
+    max: 60000
+    step: 10
+    unit_of_measurement: mL
+    mode: box
+    icon: mdi:cup-water
+  kamoer_auto_ml:
+    name: Kamoer AUTO Volume
+    min: 1000
+    max: 60000
+    step: 500
+    unit_of_measurement: mL
+    mode: box
+    icon: mdi:water-sync
+  kamoer_manual_fill_ml:
+    name: Kamoer Manual Fill Volume
+    min: 0
+    max: 60000
+    step: 500
+    unit_of_measurement: mL
+    mode: box
+    icon: mdi:water-plus
+  kamoer_manual_drain_ml:
+    name: Kamoer Manual Drain Volume
+    min: 0
+    max: 60000
+    step: 500
+    unit_of_measurement: mL
+    mode: box
+    icon: mdi:water-minus
+  kamoer_head_gap_s:          # gap between starting the two heads (app needs a few s)
+    name: Kamoer Head Start Gap
+    min: 1
+    max: 15
+    step: 1
+    unit_of_measurement: s
+    mode: box
+    icon: mdi:timer-sand
+  kamoer_safety_drop_in:
+    name: Kamoer Safety Drop Threshold
+    min: 0.2
+    max: 5
+    step: 0.05
+    unit_of_measurement: in
+    mode: box
+    icon: mdi:arrow-collapse-down
+  kamoer_sump_floor_in:       # ABSOLUTE minimum sump level — below this = cut power, always
+    name: Kamoer Sump Absolute Floor
+    min: 0
+    max: 40
+    step: 0.1
+    unit_of_measurement: in
+    mode: box
+    icon: mdi:alert
+  kamoer_sump_baseline_in:
+    name: Kamoer Sump Baseline
+    min: 0
+    max: 60
+    step: 0.01
+    unit_of_measurement: in
+    mode: box
+    icon: mdi:ruler
+
+timer:
+  kamoer_change:
+    name: Kamoer Change Timer
+
+#############################  SCRIPTS  #############################
+script:
+  # ---- single source of truth for publishing: advances the seq, then sends ----
+  kamoer_send:
+    alias: "Kamoer — send (auto-seq)"
+    icon: mdi:send
+    mode: queued          # serialise so seq increments don't race
+    max: 20
+    fields:
+      body: { description: "hex after the seq byte" }
+    sequence:
+      - variables:
+          ns: "{{ (states('input_number.kamoer_seq') | int(0) + 1) % 256 }}"
+      - action: input_number.set_value
+        target: { entity_id: input_number.kamoer_seq }
+        data: { value: "{{ ns }}" }
+      - action: mqtt.publish
+        data:
+          topic: "/sys/<PK>/<DN>/thing/service/property/set"
+          payload: >-
+            {"method":"thing.service.property.set","id":"{{ now().timestamp()|int }}","params":{"PumpSerialNumber":"{{ '%02x' % ns }}{{ body }}"},"version":"1.0.0"}
+
+  # ---- single-head commands (volume optional, defaults to kamoer_volume) ----
+  kamoer_add_seawater_start:
+    alias: "Kamoer — Add Sea Water START"
+    icon: mdi:water-plus
+    fields: { volume: { description: "mL (optional)" } }
+    sequence:
+      - action: script.kamoer_send
+        data:
+          body: "0200070008000e010100{{ pack((volume | default(states('input_number.kamoer_volume'), true)) | float, '>f').hex() }}"
+
+  kamoer_add_seawater_stop:
+    alias: "Kamoer — Add Sea Water STOP"
+    icon: mdi:water-off
+    sequence:
+      - action: script.kamoer_send
+        data: { body: "0200070008000e01000042c80000" }
+
+  kamoer_discharge_start:
+    alias: "Kamoer — Discharge START"
+    icon: mdi:water-minus
+    fields: { volume: { description: "mL (optional)" } }
+    sequence:
+      - action: script.kamoer_send
+        data:
+          body: "0200070008000e000100{{ pack((volume | default(states('input_number.kamoer_volume'), true)) | float, '>f').hex() }}"
+
+  kamoer_discharge_stop:
+    alias: "Kamoer — Discharge STOP"
+    icon: mdi:water-off
+    sequence:
+      - action: script.kamoer_send
+        data: { body: "0200070008000e00000042c80000" }
+
+  kamoer_status_poll:
+    alias: "Kamoer — Poll Status (read-only)"
+    icon: mdi:refresh
+    sequence:
+      - action: script.kamoer_send
+        data: { body: "00000000080005" }
+
+  # ---- burst stop: send both-head stops several times (single stop is unreliable) ----
+  kamoer_stop_both:
+    alias: "Kamoer — Stop Both (burst)"
+    icon: mdi:hand-back-right
+    mode: restart
+    sequence:
+      - repeat:
+          count: 4
+          sequence:
+            - action: script.kamoer_discharge_stop
+            - action: script.kamoer_add_seawater_stop
+            - delay: "00:00:01"
+
+  # ---- soft stop: MQTT burst only, NEVER touches power. This is what safety automations use. ----
+  kamoer_soft_stop:
+    alias: "Kamoer — Soft Stop (MQTT only, no power)"
+    icon: mdi:hand-back-right
+    mode: restart
+    sequence:
+      - action: script.kamoer_stop_both
+      - action: timer.cancel
+        target: { entity_id: timer.kamoer_change }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.kamoer_change_running }
+
+  kamoer_emergency_stop:
+    alias: "Kamoer — EMERGENCY STOP (manual last resort)"
+    icon: mdi:alert
+    mode: restart
+    sequence:
+      # MQTT burst-stop FIRST (normal, non-disruptive). Power cut is a genuine last resort —
+      # it forces a cold boot, which is the device's only real failure mode. Manual use only.
+      - action: script.kamoer_stop_both
+      - action: switch.turn_off
+        target: { entity_id: switch.kamoer_x2sr }
+
+  kamoer_power_on:
+    alias: "Kamoer — Power On (ready)"
+    icon: mdi:power-plug
+    sequence:
+      - action: switch.turn_on
+        target: { entity_id: switch.kamoer_x2sr }
+
+  # ---- orchestration ----
+  kamoer_change_start:
+    alias: "Kamoer — Start Water Change (fill+drain)"
+    icon: mdi:water-sync
+    mode: single
+    fields:
+      fill_ml: { description: "fill volume mL" }
+      drain_ml: { description: "drain volume mL" }
+    sequence:
+      - condition: state
+        entity_id: input_boolean.kamoer_safety_lockout
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.kamoer_change_running
+        state: "off"
+      - variables:
+          fml: "{{ fill_ml | int(0) }}"
+          dml: "{{ drain_ml | int(0) }}"
+      - condition: template
+        value_template: "{{ [fml, dml] | max > 0 }}"
+      - action: input_number.set_value
+        target: { entity_id: input_number.kamoer_sump_baseline_in }
+        data: { value: "{{ states('sensor.your_sump_level') | float }}" }
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.kamoer_change_running }
+      # start heads with a mandatory gap (device dedups near-simultaneous commands)
+      - if: "{{ fml > 0 }}"
+        then:
+          - action: script.kamoer_add_seawater_start
+            data: { volume: "{{ fml }}" }
+      - if: "{{ fml > 0 and dml > 0 }}"
+        then:
+          - delay: "00:00:{{ '%02d' % (states('input_number.kamoer_head_gap_s') | int(4)) }}"
+      - if: "{{ dml > 0 }}"
+        then:
+          - action: script.kamoer_discharge_start
+            data: { volume: "{{ dml }}" }
+      # runtime guard backstop (~900 mL/min per head, +20% +5 min)
+      - action: timer.start
+        target: { entity_id: timer.kamoer_change }
+        data:
+          duration: "{{ ([fml, dml] | max / 900 * 60 * 1.2) | int + 300 }}"
+      # heads are already spinning + timer active, so this poll can't collide with the spaced
+      # starts — it just refreshes telemetry fast so the dashboard shows live x/y within seconds
+      - delay: "00:00:03"
+      - action: script.kamoer_status_poll
+
+  kamoer_change_finish:
+    alias: "Kamoer — Finish/Stop Water Change"
+    icon: mdi:water-check
+    sequence:
+      - action: script.kamoer_stop_both
+      - action: timer.cancel
+        target: { entity_id: timer.kamoer_change }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.kamoer_change_running }
+
+  kamoer_manual_change:
+    alias: "Kamoer — Run MANUAL Change"
+    icon: mdi:water-boiler
+    sequence:
+      - condition: state
+        entity_id: input_boolean.kamoer_safety_lockout
+        state: "off"
+      - action: script.kamoer_change_start
+        data:
+          fill_ml: "{{ states('input_number.kamoer_manual_fill_ml') | int }}"
+          drain_ml: "{{ states('input_number.kamoer_manual_drain_ml') | int }}"
+
+#############################  MQTT + DECODED SENSORS  #############################
+mqtt:
+  sensor:
+    - name: "Kamoer X2SR Telemetry"
+      unique_id: kamoer_x2sr_telemetry
+      state_topic: "/sys/<PK>/<DN>/thing/event/property/post"
+      value_template: "{{ value_json.params.PumpSerialNumber[:16] }}"
+      json_attributes_topic: "/sys/<PK>/<DN>/thing/event/property/post"
+      json_attributes_template: "{{ {'raw': value_json.params.PumpSerialNumber} | to_json }}"
+      icon: mdi:pump
+
+template:
+  - sensor:
+      # target volume of the active run (mL) — only updates while running
+      - name: "Kamoer Target mL"
+        unique_id: kamoer_target_ml
+        unit_of_measurement: mL
+        state: >
+          {% set r = state_attr('sensor.kamoer_x2sr_telemetry','raw') %}
+          {% if r and '00580005' in r and r|length >= 70 and r[50:52]|int(0,16) > 0 %}
+            {% set n = r[54:62]|int(0,16) %}{% set e = (n // 8388608) % 256 %}
+            {{ ((1 + (n % 8388608)/8388608) * 2**(e-127)) | round(0) if e > 0 else 0 }}
+          {% else %}{{ states('sensor.kamoer_target_ml') }}{% endif %}
+
+      # volume transferred so far (mL) = target - remaining
+      - name: "Kamoer Transferred mL"
+        unique_id: kamoer_transferred_ml
+        unit_of_measurement: mL
+        icon: mdi:water-check
+        state: >
+          {% set r = state_attr('sensor.kamoer_x2sr_telemetry','raw') %}
+          {% if r and '00580005' in r and r|length >= 70 and r[50:52]|int(0,16) > 0 %}
+            {% set tn = r[54:62]|int(0,16) %}{% set te = (tn // 8388608) % 256 %}
+            {% set tv = (1 + (tn % 8388608)/8388608) * 2**(te-127) if te > 0 else 0 %}
+            {% set rn = r[62:70]|int(0,16) %}{% set re = (rn // 8388608) % 256 %}
+            {% set rv = (1 + (rn % 8388608)/8388608) * 2**(re-127) if re > 0 else 0 %}
+            {{ (tv - rv) | round(0) }}
+          {% else %}{{ states('sensor.kamoer_transferred_ml') }}{% endif %}
+
+      # progress %
+      - name: "Kamoer Progress"
+        unique_id: kamoer_progress
+        unit_of_measurement: "%"
+        icon: mdi:progress-clock
+        state: >
+          {% set t = states('sensor.kamoer_target_ml') | float(0) %}
+          {% set x = states('sensor.kamoer_transferred_ml') | float(0) %}
+          {{ (100 * x / t) | round(0) if t > 0 else 0 }}
+
+  - binary_sensor:
+      # device-reported running (fill head run-flag byte); refine for drain during retest
+      - name: "Kamoer Running"
+        unique_id: kamoer_running
+        icon: mdi:pump
+        state: >
+          {% set r = state_attr('sensor.kamoer_x2sr_telemetry','raw') %}
+          {% if r and '00580005' in r and r|length >= 52 %}
+            {{ 'on' if r[50:52]|int(0,16) > 0 else 'off' }}
+          {% else %}{{ states('binary_sensor.kamoer_running') }}{% endif %}
+
+#############################  AUTOMATIONS  #############################
+automation:
+  - id: kamoer_auto_daily
+    alias: "Kamoer — AUTO daily water change 17:00"
+    trigger:
+      - platform: time
+        at: "17:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.kamoer_auto_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.kamoer_safety_lockout
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.kamoer_change_running
+        state: "off"
+    action:
+      - action: script.kamoer_change_start
+        data:
+          fill_ml: "{{ states('input_number.kamoer_auto_ml') | int }}"
+          drain_ml: "{{ states('input_number.kamoer_auto_ml') | int }}"
+
+  # keep progress fresh while a change runs (single publisher, gentle cadence)
+  - id: kamoer_poll_while_running
+    alias: "Kamoer — poll status while running"
+    trigger:
+      - platform: time_pattern
+        seconds: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.kamoer_change_running
+        state: "on"
+      # only once the guard timer is active (i.e. heads already started) so polls
+      # never collide with the spaced head-start commands
+      - condition: state
+        entity_id: timer.kamoer_change
+        state: "active"
+    action:
+      - action: script.kamoer_status_poll
+
+  - id: kamoer_abs_floor
+    alias: "Kamoer — SAFETY absolute sump floor (MQTT stop + latch)"
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.your_sump_level
+        below: input_number.kamoer_sump_floor_in
+    condition:
+      # ignore a 0/unset floor (no protection configured yet) to avoid false trips
+      - condition: numeric_state
+        entity_id: input_number.kamoer_sump_floor_in
+        above: 0
+    action:
+      # MQTT stop + latch only. NO power cut — nothing here is time-critical (see philosophy).
+      - action: script.kamoer_soft_stop
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.kamoer_safety_lockout }
+      - action: persistent_notification.create
+        data:
+          notification_id: kamoer_floor
+          title: "⚠️ Kamoer — SUMP BELOW ABSOLUTE FLOOR (stopped)"
+          message: >-
+            External sump {{ states('sensor.your_sump_level') }} in fell below the absolute
+            floor {{ states('input_number.kamoer_sump_floor_in') }} in. Change STOPPED via MQTT
+            and latched (power left ON). Investigate before toggling OFF the Kamoer Safety Lockout.
+
+  - id: kamoer_safety_cutoff
+    alias: "Kamoer — SAFETY sump-drop cutoff (reservoir empty)"
+    mode: single
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ is_state('input_boolean.kamoer_change_running', 'on')
+             and states('sensor.your_sump_level') | float(99)
+                 < (states('input_number.kamoer_sump_baseline_in') | float
+                    - states('input_number.kamoer_safety_drop_in') | float(0.79)) }}
+    action:
+      # MQTT stop + latch only. An empty reservoir just under-fills the change — no hazard,
+      # and the peristaltic heads run dry safely — so there is no reason to cut power.
+      - action: script.kamoer_soft_stop
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.kamoer_safety_lockout }
+      - action: persistent_notification.create
+        data:
+          notification_id: kamoer_reservoir_empty
+          title: "⚠️ Kamoer STOPPED — Salt Water Reservoir Empty"
+          message: >-
+            External sump fell more than {{ states('input_number.kamoer_safety_drop_in') }} in
+            during a water change (baseline {{ states('input_number.kamoer_sump_baseline_in') }} in,
+            now {{ states('sensor.your_sump_level') }} in). The pump is draining to waste
+            without replacement — the saltwater reservoir is likely EMPTY. Change STOPPED via MQTT
+            and LATCHED (power left ON). Refill the reservoir, then toggle OFF the Kamoer Safety Lockout to resume.
+
+  - id: kamoer_nonresponse_watchdog
+    alias: "Kamoer — non-response watchdog (SOLE auto power cut)"
+    mode: single
+    # The only automation permitted to cut power, and only as a genuine last resort:
+    # a change is meant to be running but the device has reported NOT running (or gone
+    # silent) continuously for 30 min => it's ignoring MQTT. Reboot it via power to
+    # recover. Everything else stops via MQTT and leaves power alone.
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.kamoer_running
+        to: "off"
+        for: "00:30:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.kamoer_change_running
+        state: "on"
+    action:
+      - action: script.kamoer_emergency_stop        # MQTT burst, THEN power cut
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.kamoer_change_running }
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.kamoer_safety_lockout }
+      - action: persistent_notification.create
+        data:
+          notification_id: kamoer_nonresponse
+          title: "⚠️ Kamoer UNRESPONSIVE — power cut to recover"
+          message: >-
+            A change was active but the pump reported not-running for 30 min (ignoring MQTT).
+            Sent MQTT stop then CUT POWER to force a clean reboot. Latched. Once it reconnects,
+            verify telemetry then toggle OFF the Kamoer Safety Lockout.
+
+  - id: kamoer_change_timer_finished
+    alias: "Kamoer — change timer finished"
+    trigger:
+      - platform: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.kamoer_change
+    action:
+      - action: script.kamoer_change_finish
+
+  - id: kamoer_autostop_detected
+    alias: "Kamoer — device auto-stop detected → finish early"
+    mode: single
+    # The device self-terminates at the target volume (validated: ~5.4 min for 4.5 L, both heads
+    # stop with run-flag 01→00 at exactly target). Detect that from telemetry and finish the
+    # change at once, so the ~11 min guard timer is only a backstop and the dashboard flips to
+    # 'idle' promptly instead of minutes late.
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.kamoer_running
+        to: "off"
+        for: "00:00:08"
+    condition:
+      - condition: state
+        entity_id: input_boolean.kamoer_change_running
+        state: "on"
+      # only when it actually reached target — guards against a spurious idle telemetry frame
+      # ending a change early
+      - condition: template
+        value_template: >-
+          {{ states('sensor.kamoer_transferred_ml')|float(0)
+             >= states('sensor.kamoer_target_ml')|float(999999) - 150 }}
+    action:
+      - action: script.kamoer_change_finish
+
+  - id: kamoer_lockout_cleared
+    alias: "Kamoer — lockout cleared dismisses notification"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.kamoer_safety_lockout
+        to: "off"
+    action:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: kamoer_reservoir_empty
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: kamoer_floor
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: kamoer_nonresponse
